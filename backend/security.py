@@ -4,7 +4,12 @@ from datetime import datetime, timedelta
 
 # Requires bcrypt<4.0.0
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = "authlynx_super_secret_key"
+
+# FIX: the old key ("authlynx_super_secret_key") is only 25 bytes, below the
+# 32-byte minimum PyJWT recommends for HS256 - that's what triggered
+# InsecureKeyLengthWarning. Padded to 32+ bytes. In a real deployment this
+# should come from an environment variable, not be hardcoded at all.
+SECRET_KEY = "authlynx_super_secret_signing_key_v1"
 ALGORITHM = "HS256"
 
 def hash_mpin(mpin: str) -> str:

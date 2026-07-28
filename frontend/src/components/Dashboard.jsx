@@ -117,7 +117,10 @@ export default function Dashboard({ authData, onLogout }) {
         </button>
       </div>
 
-      <ContinuousAuth token={authData.access_token} onSessionExpired={onLogout} />
+      {/* FIX: userId was never being passed here, so ContinuousAuth's
+          `if (!token || !userId) return;` guard bailed out immediately and
+          the camera/mic cycle never started. */}
+      <ContinuousAuth token={authData.access_token} userId={currentUserId} onSessionExpired={onLogout} />
 
       {/* Simulator Panel without Source Folder Dropdown */}
       <div className="mb-8 p-6 bg-red-50 border-2 border-red-200 rounded-2xl shadow-sm">

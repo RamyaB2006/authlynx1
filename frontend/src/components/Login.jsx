@@ -6,13 +6,15 @@ export default function Login({ onLoginSuccess }) {
   const [mpin, setMpin] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  
+
   // Recording control states
   const [recordingState, setRecordingState] = useState('idle'); // 'idle' | 'recording' | 'done'
-  const [recordingSeconds, setRecordingSeconds] = useState(3);
+  const [recordingSeconds, setRecordingSeconds] = useState(4);
+  const RECORD_SECONDS = 4; // matches Register.jsx so both voiceprints come from comparable-length speech
 
   const videoRef = useRef(null);
-  const mediaStreamRef = useRef(null);
+  const mediaStreamRef = useRef(null);   // full A/V stream - used for the video preview + frame capture
+  const audioStreamRef = useRef(null);   // audio-only sub-stream - used for the voice recorder
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const audioContextRef = useRef(null);
@@ -60,13 +62,22 @@ export default function Login({ onLoginSuccess }) {
           videoRef.current.srcObject = stream;
         }
 
+        // Only the audio track(s) go to the recorder/analyser. Recording from
+        // the combined video+audio stream was producing a muxed video/webm
+        // container labelled as "audio", which some browsers/codecs decode
+        // unreliably on the backend - splitting it out fixes both the
+        // "recording doesn't seem to capture anything" issue and downstream
+        // voice-match failures caused by corrupted/garbled audio extraction.
+        const audioOnlyStream = new MediaStream(stream.getAudioTracks());
+        audioStreamRef.current = audioOnlyStream;
+
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         audioContextRef.current = audioCtx;
         const analyser = audioCtx.createAnalyser();
         analyser.fftSize = 64;
         analyserRef.current = analyser;
 
-        const source = audioCtx.createMediaStreamSource(stream);
+        const source = audioCtx.createMediaStreamSource(audioOnlyStream);
         source.connect(analyser);
       })
       .catch((err) => {
@@ -89,14 +100,14 @@ export default function Login({ onLoginSuccess }) {
 
   // Function triggered when user clicks "Start Voice Recording"
   const startVoiceRecording = () => {
-    if (!mediaStreamRef.current) {
-      alert("Camera/Microphone stream not ready.");
+    if (!audioStreamRef.current || audioStreamRef.current.getAudioTracks().length === 0) {
+      alert("Microphone stream not ready.");
       return;
     }
 
     audioChunksRef.current = [];
-    const mediaRecorder = new MediaRecorder(mediaStreamRef.current);
-    
+    const mediaRecorder = new MediaRecorder(audioStreamRef.current);
+
     mediaRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
         audioChunksRef.current.push(event.data);
@@ -106,12 +117,12 @@ export default function Login({ onLoginSuccess }) {
     mediaRecorder.start();
     mediaRecorderRef.current = mediaRecorder;
     setRecordingState('recording');
-    setRecordingSeconds(3);
+    setRecordingSeconds(RECORD_SECONDS);
 
     drawVisualizer();
 
-    // 3-Second Countdown Timer
-    let timeLeft = 3;
+    // Countdown Timer
+    let timeLeft = RECORD_SECONDS;
     const timerInterval = setInterval(() => {
       timeLeft -= 1;
       if (timeLeft > 0) {
@@ -130,7 +141,7 @@ export default function Login({ onLoginSuccess }) {
   const handleLogin = async (e) => {
     e.preventDefault();
     if (recordingState !== 'done') {
-      alert("Please record your 3-second voice sample first.");
+      alert("Please record your voice sample first.");
       return;
     }
 
@@ -160,14 +171,14 @@ export default function Login({ onLoginSuccess }) {
       const formData = new FormData();
       formData.append('customer_id', customerId.trim());
       formData.append('mpin', mpin.trim());
-      formData.append('role', 'Account Holder'); 
+      formData.append('role', 'Account Holder');
       formData.append('frame', frameBlob, 'frame.jpg');
       formData.append('audio', audioBlob, 'voice.webm');
 
       const res = await axios.post('http://127.0.0.1:8000/login', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
-      
+
       onLoginSuccess(res.data);
     } catch (err) {
       if (err.response && err.response.data && err.response.data.detail) {
@@ -189,12 +200,12 @@ export default function Login({ onLoginSuccess }) {
 
       {/* Video Feed Preview */}
       <div className="mb-6 relative w-full h-44 bg-slate-900 rounded-xl overflow-hidden border border-slate-200 shadow-inner flex items-center justify-center">
-        <video 
-          ref={videoRef} 
-          autoPlay 
-          playsInline 
-          muted 
-          className="w-full h-full object-cover transform scale-x-[-1]" 
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          className="w-full h-full object-cover transform scale-x-[-1]"
         />
         <div className="absolute top-2 right-2 px-2.5 py-1 bg-black/60 backdrop-blur-md rounded-full text-[10px] font-bold text-white flex items-center space-x-1.5">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
@@ -226,35 +237,35 @@ export default function Login({ onLoginSuccess }) {
       <form onSubmit={handleLogin} className="space-y-4">
         <div>
           <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Customer ID / Mobile</label>
-          <input 
-            type="text" 
-            required 
-            value={customerId} 
-            onChange={e => setCustomerId(e.target.value)} 
+          <input
+            type="text"
+            required
+            value={customerId}
+            onChange={e => setCustomerId(e.target.value)}
             placeholder="Enter Customer ID"
-            className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500" 
+            className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
 
         <div>
           <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">4-Digit MPIN</label>
-          <input 
-            type="password" 
-            maxLength="4" 
-            required 
-            value={mpin} 
-            onChange={e => setMpin(e.target.value)} 
+          <input
+            type="password"
+            maxLength="4"
+            required
+            value={mpin}
+            onChange={e => setMpin(e.target.value)}
             placeholder="••••"
-            className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium tracking-widest focus:outline-none focus:ring-2 focus:ring-blue-500" 
+            className="w-full p-3.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium tracking-widest focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
         </div>
 
-        <button 
-          type="submit" 
+        <button
+          type="submit"
           disabled={loading || recordingState !== 'done'}
           className="w-full py-4 bg-blue-600 hover:bg-blue-700 transition-colors rounded-xl font-bold text-white shadow-lg shadow-blue-600/20 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer mt-2"
         >
-          {loading ? 'Authenticating Biometrics...' : recordingState !== 'done' ? 'Please record 3s voice sample first' : 'Authenticate Identity'}
+          {loading ? 'Authenticating Biometrics...' : recordingState !== 'done' ? 'Please record your voice sample first' : 'Authenticate Identity'}
         </button>
 
         {error && (
