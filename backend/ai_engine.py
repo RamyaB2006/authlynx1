@@ -4,18 +4,57 @@ import traceback
 import subprocess
 import cv2
 import torch
+import torch.nn as nn
 import torchvision.transforms as T
+import torchvision.models as tv_models
 import torchaudio.transforms as AT
 import soundfile as sf
 import numpy as np
 from PIL import Image
+from facenet_pytorch import MTCNN
+
+
+# ----------------------------------------------------------------------
+# Voice spoof classifier - architecture copied verbatim from
+# scripts/train_voice_model.py so the state_dict loads cleanly.
+# Output classes: 0 = bonafide/genuine, 1 = replay, 2 = AI-generated.
+# ----------------------------------------------------------------------
+class VoiceSpoofCNN(nn.Module):
+    def __init__(self):
+        super(VoiceSpoofCNN, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)
+        )
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)
+        )
+
+    def forward(self, x):
+        return self.fc(self.conv(x))
 
 
 class AIEngine:
+    # Trained weight paths - relative to backend/ (where main.py runs from)
+    DEEPFAKE_MODEL_PATH = os.path.join("trained_models", "deepfake_mobilenetv3.pth")
+    VOICE_SPOOF_MODEL_PATH = os.path.join("trained_models", "voice_spoof_cnn.pth")
+
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[INFO] Initializing AIEngine inference on device: {self.device}")
 
+        # --- Voiceprint feature extractor (face/voice MATCHING at login -
+        # unrelated to spoof DETECTION below, left exactly as before) ---
         self.mfcc_transform = AT.MelSpectrogram(
             sample_rate=16000,
             n_mels=40,
@@ -26,25 +65,70 @@ class AIEngine:
         haarcascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'  # type: ignore
         self.face_cascade = cv2.CascadeClassifier(haarcascade_path)
 
-        # Cache resamplers per source sample rate instead of rebuilding the
-        # FIR filter design on every single request (was a needless per-call
-        # cost, even though in practice sr is usually already 16000 by the
-        # time it gets here since ffmpeg already resamples during conversion).
         self._resamplers = {}
 
-        # Starting-point thresholds only - see calibrate_threshold().
-        self.video_sharpness_threshold = 60.0
-        self.video_jitter_threshold = 18.0
-        self.audio_variance_threshold = 0.005
-        self.audio_flatness_threshold = 0.45
+        # ------------------------------------------------------------
+        # Real trained deepfake video/image classifier
+        # (torchvision mobilenet_v3_small, classifier[3] -> Linear(*, 2))
+        # ------------------------------------------------------------
+        self.mtcnn = MTCNN(keep_all=False, select_largest=True, post_process=False, device=self.device)
+
+        self.deepfake_transform = T.Compose([
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+        self.deepfake_model = tv_models.mobilenet_v3_small(weights=None)
+        in_features = int(getattr(self.deepfake_model.classifier[3], "in_features"))
+        self.deepfake_model.classifier[3] = nn.Linear(in_features, 2)
+        self._load_state_dict_safely(self.deepfake_model, self.DEEPFAKE_MODEL_PATH, "deepfake_mobilenetv3")
+        self.deepfake_model.to(self.device).eval()
+
+        # ------------------------------------------------------------
+        # Real trained voice spoof classifier (ASVspoof2019 LA)
+        # ------------------------------------------------------------
+        self.voice_spoof_mfcc_transform = AT.MFCC(
+            sample_rate=16000,
+            n_mfcc=40,
+            melkwargs={"n_mels": 40, "n_fft": 400, "hop_length": 160, "mel_scale": "htk"}
+        ).to(self.device)
+        self.voice_spoof_target_samples = 48000  # exactly 3s @ 16kHz, matches training
+
+        self.voice_spoof_model = VoiceSpoofCNN()
+        self._load_state_dict_safely(self.voice_spoof_model, self.VOICE_SPOOF_MODEL_PATH, "voice_spoof_cnn")
+        self.voice_spoof_model.to(self.device).eval()
+
+        # Starting-point thresholds - only used for the behavioral heuristic
+        # and the decision cutoff on top of the two trained models' fake
+        # probability (both output a 0-1 probability; 50 is the natural
+        # midpoint since training used CrossEntropyLoss with balanced
+        # intent, not a heuristic guess like the old thresholds were).
         self.video_fake_decision_cutoff = 50.0
         self.audio_fake_decision_cutoff = 50.0
-        self.sensitivity = 2.5
 
-        # --- Speed knobs for simulate-attack video analysis ---
-        self.video_target_samples = 10     # frames actually run through face cascade
-        self.video_max_decode_frames = 60  # hard cap on frames even read, bounds worst-case time
-        self.video_analysis_max_width = 400  # downscale before detection
+        # --- Speed knobs for video analysis ---
+        self.video_target_samples = 8       # frames actually run through MTCNN+model
+        self.video_max_decode_frames = 60   # hard cap on frames even read
+        self.video_analysis_max_width = 400  # downscale before MTCNN detect (speed only; crop uses full-res frame)
+
+    # ------------------------------------------------------------------
+    # Model loading helper
+    # ------------------------------------------------------------------
+    def _load_state_dict_safely(self, model: nn.Module, rel_path: str, label: str):
+        if not os.path.exists(rel_path):
+            print(f"[ERROR] {label} weights not found at '{rel_path}'. "
+                  f"Model will run with RANDOM (untrained) weights - predictions will be meaningless "
+                  f"until this file is present.")
+            return
+        try:
+            state_dict = torch.load(rel_path, map_location=self.device, weights_only=True)
+        except Exception:
+            # Older torch.save() checkpoints (or ones containing non-tensor
+            # metadata) may not be loadable with weights_only=True.
+            state_dict = torch.load(rel_path, map_location=self.device, weights_only=False)
+        model.load_state_dict(state_dict)
+        print(f"[INFO] Loaded {label} weights from '{rel_path}'")
 
     # ------------------------------------------------------------------
     # Audio format handling
@@ -53,14 +137,6 @@ class AIEngine:
         """
         Converts arbitrary audio bytes (webm/opus from MediaRecorder, mp4/aac,
         etc.) into 16kHz mono WAV bytes using ffmpeg.
-
-        FIX (speed): previously wrote the input to disk, ran ffmpeg file->file,
-        then read the output back from disk (2 writes + 2 reads + 2 deletes
-        per call). Now pipes bytes directly through ffmpeg's stdin/stdout -
-        no temp files at all in the common case. Falls back to the old
-        temp-file approach only if the pipe conversion fails (some containers
-        like certain .m4a/.mp4 files need a seekable input for a trailing
-        moov atom, which a pipe can't provide).
         """
         cmd = ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"]
         try:
@@ -94,15 +170,7 @@ class AIEngine:
                     os.remove(p)
 
     def _read_audio_bytes(self, audio_bytes: bytes, suffix_hint: str = ".webm"):
-        """
-        Reads audio bytes into (numpy_array, sample_rate).
-
-        FIX (speed): reads happen fully in-memory (io.BytesIO) instead of
-        writing a "probe" temp file to disk first. Also skips the doomed
-        soundfile attempt entirely for formats libsndfile can never decode
-        (webm/opus/mp3/m4a) instead of trying-and-failing first - goes
-        straight to ffmpeg for those.
-        """
+        """Reads audio bytes into (numpy_array, sample_rate)."""
         suffix = (suffix_hint or "").lower()
         natively_decodable = suffix in (".wav", ".flac", ".ogg")
 
@@ -117,6 +185,7 @@ class AIEngine:
 
     # ------------------------------------------------------------------
     # Voice preprocessing - makes registration and login clips comparable
+    # (used for the voiceprint/matching path only, not spoof detection)
     # ------------------------------------------------------------------
     def _trim_silence(self, audio_np: np.ndarray, sr: int, frame_ms: int = 20,
                        energy_percentile: float = 55.0) -> np.ndarray:
@@ -158,37 +227,10 @@ class AIEngine:
             return audio_np
         return (audio_np.astype(np.float64) * (target_peak / peak)).astype(np.float32)
 
-    def calibrate_threshold(self, real_values, fake_values):
-        real_values = np.array(real_values, dtype=np.float64)
-        fake_values = np.array(fake_values, dtype=np.float64)
-        candidates = np.unique(np.concatenate([real_values, fake_values]))
-
-        best_j = -1.0
-        best_threshold = float(np.median(candidates))
-        best_direction = "above_is_fake"
-
-        for t in candidates:
-            tpr_a = np.mean(fake_values > t) if len(fake_values) else 0.0
-            fpr_a = np.mean(real_values > t) if len(real_values) else 0.0
-            j_a = tpr_a - fpr_a
-
-            tpr_b = np.mean(fake_values <= t) if len(fake_values) else 0.0
-            fpr_b = np.mean(real_values <= t) if len(real_values) else 0.0
-            j_b = tpr_b - fpr_b
-
-            if j_a >= j_b and j_a > best_j:
-                best_j, best_threshold, best_direction = j_a, float(t), "above_is_fake"
-            elif j_b > j_a and j_b > best_j:
-                best_j, best_threshold, best_direction = j_b, float(t), "below_is_fake"
-
-        print(f"[CALIBRATION] threshold={best_threshold}, direction={best_direction}, J={best_j:.3f}")
-        return best_threshold, best_direction
-
     def detect_faces(self, cv2_img):
-        """Fast single-image face count - used for the 20s-window quick
-        check as well as login. Downscales large frames first since Haar
-        cascade cost scales with pixel count and webcam frames don't need
-        full resolution for a simple count."""
+        """Fast single-image face COUNT - used for the 20s-window quick
+        check as well as login (not for deepfake classification, which
+        uses MTCNN separately below to match training preprocessing)."""
         try:
             if cv2_img is None:
                 return 0
@@ -256,42 +298,57 @@ class AIEngine:
             print(f"[ERROR] Voice extraction failed: {e}")
             return [0.0] * 40
 
-    # ------------------------------------------------------------------
-    # Scoring helpers
-    # ------------------------------------------------------------------
-    def _sigmoid_score(self, value, threshold, sensitivity, above_is_fake=True):
-        safe_threshold = threshold if abs(threshold) > 1e-9 else 1e-9
-        normalized_diff = (value - safe_threshold) / abs(safe_threshold)
-        if not above_is_fake:
-            normalized_diff = -normalized_diff
-        return float(1.0 / (1.0 + np.exp(-sensitivity * normalized_diff)))
-
-    def _face_temporal_jitter(self, face_variances):
-        if len(face_variances) < 2:
-            return 0.0
-        deltas = np.diff(np.array(face_variances, dtype=np.float64))
-        return float(np.std(deltas))
-
-    def _spectral_flatness(self, audio_np, sr):
-        if audio_np.ndim > 1:
-            audio_np = audio_np.mean(axis=1)
-        spectrum = np.abs(np.fft.rfft(audio_np.astype(np.float64)))
-        spectrum = spectrum[spectrum > 1e-12]
-        if len(spectrum) == 0:
-            return 0.0
-        geo_mean = np.exp(np.mean(np.log(spectrum)))
-        arith_mean = np.mean(spectrum)
-        if arith_mean <= 1e-12:
-            return 0.0
-        return float(geo_mean / arith_mean)
-
     def compute_behavioral_score(self, typing_speed, hold_time, latency, rhythm, error_rate):
+        # NOTE: kept as a heuristic on purpose - see project notes.
+        # trained_models/behavioral_isolation_forest.pkl was fit on
+        # synthetic np.random.normal() data (5 typing + 4 mouse features)
+        # and the frontend only sends 5 randomly-generated typing metrics
+        # with no real mouse tracking, so neither side of that model is
+        # measuring anything real yet. Wiring it in would just swap one
+        # placeholder for another while adding a shape mismatch (9 vs 5
+        # features) that would crash at inference time. Revisit once
+        # ContinuousAuth.jsx captures actual keystroke/mouse telemetry.
         speed_score = 100 - min(abs(typing_speed - 67.5) * 2, 100)
         hold_score = 100 - min(abs(hold_time - 85) * 2, 100)
         latency_score = 100 - min(abs(latency - 40) * 1.5, 100)
         rhythm_score = min(max(rhythm, 0.0), 1.0) * 100
         error_score = max(100 - error_rate * 40, 0)
         return float(np.clip(np.mean([speed_score, hold_score, latency_score, rhythm_score, error_score]), 0, 100))
+
+    # ------------------------------------------------------------------
+    # Deepfake video/image classification - real trained MobileNetV3
+    # ------------------------------------------------------------------
+    def _crop_face_pil(self, pil_img: Image.Image):
+        """Runs MTCNN detection and returns the cropped face PIL image,
+        matching FaceForensicsDataset._prepare_dataset()'s crop exactly
+        (mtcnn.detect() for the box, then a plain PIL .crop() - no
+        alignment/whitening, since the model trained on that raw crop)."""
+        try:
+            detection_result = self.mtcnn.detect(pil_img)
+            boxes = detection_result[0]
+        except Exception as e:
+            print(f"[WARN] MTCNN detect failed: {e}")
+            return None
+        if boxes is None or len(boxes) == 0:
+            return None
+        b = boxes[0]
+        box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+        try:
+            return pil_img.crop(box)
+        except Exception as e:
+            print(f"[WARN] Face crop failed: {e}")
+            return None
+
+    def _classify_face_crop(self, face_pil: Image.Image) -> float:
+        """Runs one cropped face image through the trained model, returns
+        fake probability in [0, 1] (softmax over the 2-class output,
+        index 1 = fake per categories={'real':0,'fake':1} in training)."""
+        tensor_img = self.deepfake_transform(face_pil.convert("RGB"))  # type: ignore
+        tensor_img = tensor_img.unsqueeze(0).to(self.device)  # type: ignore
+        with torch.no_grad():
+            logits = self.deepfake_model(tensor_img)
+            probs = torch.softmax(logits, dim=1)
+        return float(probs[0, 1].item())
 
     def detect_deepfake(self, file_bytes, filename: str):
         try:
@@ -328,30 +385,27 @@ class AIEngine:
             return {"is_fake": False, "real_percentage": 50.0, "fake_percentage": 50.0,
                     "debug_signals": {"note": "image_decode_failed"}}
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        lap_arr = np.asarray(laplacian, dtype=np.float32)
-        img_var = float(np.var(lap_arr))
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_img)
 
-        fake_prob = self._sigmoid_score(img_var, 60.0, sensitivity=self.sensitivity, above_is_fake=False)
+        face_crop = self._crop_face_pil(pil_img)
+        if face_crop is None:
+            return {"is_fake": False, "real_percentage": 50.0, "fake_percentage": 50.0,
+                    "debug_signals": {"note": "no_face_detected"}}
+
+        fake_prob = self._classify_face_crop(face_crop)
         fake_pct = round(fake_prob * 100, 1)
         return {
             "is_fake": fake_pct > self.video_fake_decision_cutoff,
             "real_percentage": round(100.0 - fake_pct, 1),
             "fake_percentage": fake_pct,
-            "debug_signals": {"laplacian_var": img_var},
+            "debug_signals": {"model": "deepfake_mobilenetv3", "frames_analyzed": 1},
         }
 
     def _analyze_video_bytes(self, file_bytes, path_lower):
-        """
-        FIX (speed): previously decoded and ran the face cascade on up to 30
-        FULL-RESOLUTION frames sequentially from the start of the file only -
-        slow, and only covered the first couple seconds of longer clips.
-        Now: downscales before detection, and evenly samples a small target
-        number of frames across a bounded window instead of brute-forcing
-        every frame - typically an order of magnitude faster while covering
-        more of the clip.
-        """
+        """Samples a handful of frames, runs each detected face crop through
+        the trained MobileNetV3 classifier, and averages the fake
+        probability across frames that had a detectable face."""
         ext = os.path.splitext(path_lower)[1] or ".mp4"
         temp_video = f"temp_sim_{os.urandom(4).hex()}{ext}"
         with open(temp_video, "wb") as f:
@@ -379,75 +433,53 @@ class AIEngine:
                 decode_limit = self.video_max_decode_frames
                 skip = 3
 
-            face_variances = []
+            fake_probs = []
             frame_idx = 0
 
-            while cap.isOpened() and frame_idx < decode_limit and len(face_variances) < self.video_target_samples:
+            while cap.isOpened() and frame_idx < decode_limit and len(fake_probs) < self.video_target_samples:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
                 if frame_idx % skip == 0:
-                    h, w = frame.shape[:2]
-                    if w > self.video_analysis_max_width:
-                        scale = self.video_analysis_max_width / float(w)
-                        frame = cv2.resize(frame, (self.video_analysis_max_width, int(h * scale)))
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_frame = Image.fromarray(rgb_frame)
 
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = self.face_cascade.detectMultiScale(gray, 1.15, 4, minSize=(30, 30))
-                    for (x, y, w2, h2) in faces:
-                        face_roi = gray[y:y + h2, x:x + w2]
-                        laplacian = cv2.Laplacian(face_roi, cv2.CV_64F)
-                        lap_arr = np.asarray(laplacian, dtype=np.float32)
-                        face_variances.append(float(np.var(lap_arr)))
-                        break
+                    face_crop = self._crop_face_pil(pil_frame)
+                    if face_crop is not None:
+                        try:
+                            fake_probs.append(self._classify_face_crop(face_crop))
+                        except Exception as e:
+                            print(f"[WARN] Frame classification failed: {e}")
 
                 frame_idx += 1
 
             cap.release()
 
-            if len(face_variances) >= 2:
-                avg_sharpness = float(np.mean(face_variances))
-                jitter = self._face_temporal_jitter(face_variances)
+            if len(fake_probs) == 0:
+                return {"is_fake": False, "real_percentage": 50.0, "fake_percentage": 50.0,
+                        "debug_signals": {"note": "no_face_detected", "frames_checked": frame_idx}}
 
-                sharpness_fake_score = self._sigmoid_score(
-                    avg_sharpness, self.video_sharpness_threshold,
-                    sensitivity=self.sensitivity, above_is_fake=False
-                )
-                jitter_fake_score = self._sigmoid_score(
-                    jitter, self.video_jitter_threshold,
-                    sensitivity=self.sensitivity, above_is_fake=True
-                )
-                fake_prob = 0.4 * sharpness_fake_score + 0.6 * jitter_fake_score
-                fake_pct = round(fake_prob * 100, 1)
-                real_pct = round(100.0 - fake_pct, 1)
-                return {
-                    "is_fake": fake_pct > self.video_fake_decision_cutoff,
-                    "real_percentage": real_pct,
-                    "fake_percentage": fake_pct,
-                    "debug_signals": {"avg_sharpness": avg_sharpness, "jitter": jitter,
-                                       "frames_analyzed": len(face_variances)},
-                }
-
-            if len(face_variances) == 1:
-                fake_prob = self._sigmoid_score(
-                    face_variances[0], self.video_sharpness_threshold,
-                    sensitivity=self.sensitivity * 0.5, above_is_fake=False
-                )
-                fake_pct = round(fake_prob * 100, 1)
-                return {
-                    "is_fake": fake_pct > self.video_fake_decision_cutoff,
-                    "real_percentage": round(100.0 - fake_pct, 1),
-                    "fake_percentage": fake_pct,
-                    "debug_signals": {"note": "low_confidence_single_frame"},
-                }
-
-            return {"is_fake": False, "real_percentage": 50.0, "fake_percentage": 50.0,
-                    "debug_signals": {"note": "no_face_detected", "frames_checked": frame_idx}}
+            avg_fake_prob = float(np.mean(fake_probs))
+            fake_pct = round(avg_fake_prob * 100, 1)
+            real_pct = round(100.0 - fake_pct, 1)
+            return {
+                "is_fake": fake_pct > self.video_fake_decision_cutoff,
+                "real_percentage": real_pct,
+                "fake_percentage": fake_pct,
+                "debug_signals": {
+                    "model": "deepfake_mobilenetv3",
+                    "frames_analyzed": len(fake_probs),
+                    "per_frame_fake_prob": [round(p, 3) for p in fake_probs],
+                },
+            }
         finally:
             if os.path.exists(temp_video):
                 os.remove(temp_video)
 
+    # ------------------------------------------------------------------
+    # Voice spoof classification - real trained VoiceSpoofCNN
+    # ------------------------------------------------------------------
     def _analyze_audio_bytes(self, file_bytes, suffix_hint=".webm"):
         try:
             audio_np, sr = self._read_audio_bytes(file_bytes, suffix_hint=suffix_hint)
@@ -460,22 +492,58 @@ class AIEngine:
         if len(audio_np) == 0:
             return {"is_fake": False, "real_percentage": 50.0, "fake_percentage": 50.0}
 
-        audio_var = float(np.var(audio_np))
-        flatness = self._spectral_flatness(np.asarray(audio_np), sr)
+        try:
+            waveform = torch.tensor(np.asarray(audio_np), dtype=torch.float32)
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            else:
+                # stereo -> mono, matching training's torch.mean(dim=0, keepdim=True)
+                waveform = waveform.transpose(0, 1).mean(dim=0, keepdim=True)
 
-        variance_fake_score = self._sigmoid_score(
-            audio_var, self.audio_variance_threshold, sensitivity=self.sensitivity, above_is_fake=False
-        )
-        flatness_fake_score = self._sigmoid_score(
-            flatness, self.audio_flatness_threshold, sensitivity=self.sensitivity, above_is_fake=True
-        )
+            if sr != 16000:
+                if sr not in self._resamplers:
+                    self._resamplers[sr] = AT.Resample(orig_freq=sr, new_freq=16000).to(self.device)
+                waveform = self._resamplers[sr](waveform.to(self.device))
+            else:
+                waveform = waveform.to(self.device)
 
-        fake_prob = 0.4 * variance_fake_score + 0.6 * flatness_fake_score
-        fake_pct = round(fake_prob * 100, 1)
-        real_pct = round(100.0 - fake_pct, 1)
-        return {
-            "is_fake": fake_pct > self.audio_fake_decision_cutoff,
-            "real_percentage": real_pct,
-            "fake_percentage": fake_pct,
-            "debug_signals": {"audio_var": audio_var, "flatness": flatness},
-        }
+            # Pad/truncate to exactly 3s @ 16kHz (48000 samples) - matches
+            # ASVspoofDataset.__getitem__ exactly.
+            target_length = self.voice_spoof_target_samples
+            if waveform.shape[1] < target_length:
+                pad_amount = target_length - waveform.shape[1]
+                waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
+            elif waveform.shape[1] > target_length:
+                waveform = waveform[:, :target_length]
+
+            mfcc = self.voice_spoof_mfcc_transform(waveform)
+            mfcc = (mfcc - mfcc.mean()) / (mfcc.std() + 1e-8)
+            mfcc = mfcc.unsqueeze(0)  # -> [batch=1, channel=1, n_mfcc, time]
+
+            with torch.no_grad():
+                logits = self.voice_spoof_model(mfcc)
+                probs = torch.softmax(logits, dim=1)[0]
+
+            # index 0 = bonafide/genuine; fake = anything else (replay or AI-generated)
+            fake_prob = float(1.0 - probs[0].item())
+            fake_pct = round(fake_prob * 100, 1)
+            real_pct = round(100.0 - fake_pct, 1)
+
+            predicted_class = int(torch.argmax(probs).item())
+            class_names = {0: "bonafide", 1: "replay", 2: "ai_generated"}
+
+            return {
+                "is_fake": fake_pct > self.audio_fake_decision_cutoff,
+                "real_percentage": real_pct,
+                "fake_percentage": fake_pct,
+                "debug_signals": {
+                    "model": "voice_spoof_cnn",
+                    "predicted_class": class_names.get(predicted_class, str(predicted_class)),
+                    "class_probs": {class_names[i]: round(float(p), 3) for i, p in enumerate(probs.tolist())},
+                },
+            }
+        except Exception as e:
+            print(f"[ERROR] Voice spoof inference failed: {e}")
+            traceback.print_exc()
+            return {"is_fake": False, "real_percentage": 50.0, "fake_percentage": 50.0,
+                    "debug_signals": {"note": f"voice_spoof_inference_error: {e}"}}
