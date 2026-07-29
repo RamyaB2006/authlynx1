@@ -11,7 +11,7 @@ import torchaudio.transforms as AT
 import soundfile as sf
 import numpy as np
 from PIL import Image
-from facenet_pytorch import MTCNN
+from facenet_pytorch import MTCNN, InceptionResnetV1
 
 
 # ----------------------------------------------------------------------
@@ -84,6 +84,15 @@ class AIEngine:
         self.deepfake_model.classifier[3] = nn.Linear(in_features, 2)
         self._load_state_dict_safely(self.deepfake_model, self.DEEPFAKE_MODEL_PATH, "deepfake_mobilenetv3")
         self.deepfake_model.to(self.device).eval()
+
+        # ------------------------------------------------------------
+        # Face embedding model (FaceNet / InceptionResnetV1, VGGFace2
+        # weights) - used for face MATCHING at register/login. Produces
+        # a 512-dim embedding from a cropped face, invariant (to a
+        # reasonable degree) to pose/lighting/background, unlike a raw
+        # flattened-pixel vector.
+        # ------------------------------------------------------------
+        self.face_embedder = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
 
         # ------------------------------------------------------------
         # Real trained voice spoof classifier (ASVspoof2019 LA)
@@ -248,21 +257,37 @@ class AIEngine:
             return 0
 
     def extract_face_embedding(self, cv2_img):
+        """Crops the detected face (via MTCNN, same detector used elsewhere
+        in this class) and runs it through a trained FaceNet embedding
+        model (InceptionResnetV1, VGGFace2 weights) to produce a 512-dim
+        embedding. This replaces an earlier version that just flattened
+        raw pixels from the uncropped frame, which was not a real face
+        embedding and caused legitimate users to fail verification due
+        to pose/lighting/background differences between registration and
+        login captures."""
         try:
             rgb_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb_img).resize((160, 160))
+            pil_img = Image.fromarray(rgb_img)
+
+            face_crop = self._crop_face_pil(pil_img)
+            if face_crop is None:
+                print("[WARN] No face detected for embedding extraction")
+                return None
+
+            face_crop = face_crop.resize((160, 160))
 
             transform = T.Compose([
                 T.ToTensor(),
                 T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
             ])
 
-            tensor_img: torch.Tensor = transform(pil_img)  # type: ignore
+            tensor_img: torch.Tensor = transform(face_crop.convert("RGB"))  # type: ignore
             tensor_img = tensor_img.unsqueeze(0).to(self.device)
 
-            flat_vector = tensor_img.view(-1).detach().cpu().numpy()
-            embedding = [float(x) for x in flat_vector[:512]]
-            return embedding
+            with torch.no_grad():
+                embedding = self.face_embedder(tensor_img)
+
+            return embedding.squeeze().cpu().tolist()
         except Exception as e:
             print(f"[ERROR] Face extraction failed: {e}")
             return None

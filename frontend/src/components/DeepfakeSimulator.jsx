@@ -44,7 +44,7 @@ export default function DeepfakeSimulator({ onSessionExpired }) {
 
   return (
     <div className="p-6 bg-white border border-slate-200 rounded-2xl shadow-sm mb-6">
-      <h3 className="text-lg font-bold text-slate-800 mb-1">Deepfake Attack Simulator (Dataset Testing)</h3>
+      <h3 className="text-lg font-bold text-slate-800 mb-1">Deepfake Attack Simulator </h3>
       <p className="text-sm text-slate-500 mb-4">
         Upload any media file (image or audio) to test the AI classification engine and check real vs. fake confidence scores.
       </p>
@@ -65,7 +65,11 @@ export default function DeepfakeSimulator({ onSessionExpired }) {
         </button>
 
         {result && (
-          <div className={`mt-4 p-4 rounded-xl border ${result.classification === 'fake' ? 'bg-red-50 border-red-200 text-red-900' : 'bg-emerald-50 border-emerald-200 text-emerald-900'}`}>
+          <div className={`mt-4 p-4 rounded-xl border ${
+            result.classification === 'fake' ? 'bg-red-50 border-red-200 text-red-900'
+            : result.classification === 'inconclusive' ? 'bg-amber-50 border-amber-200 text-amber-900'
+            : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+          }`}>
             <p className="font-extrabold uppercase text-xs tracking-wider mb-2">
               Classification Result: {result.classification.toUpperCase()}
             </p>
@@ -74,6 +78,9 @@ export default function DeepfakeSimulator({ onSessionExpired }) {
               <p>🔴 Fake/Spoof Confidence: <span className="font-bold">{result.fake_percentage}%</span></p>
             </div>
             <p className="text-xs mt-3 font-semibold">{result.message}</p>
+            {result.debug_signals?.note && (
+              <p className="text-[10px] mt-2 font-mono opacity-70">debug: {result.debug_signals.note}</p>
+            )}
           </div>
         )}
       </div>

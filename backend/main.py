@@ -1,17 +1,24 @@
 import asyncio
 import os
+import random
+from datetime import datetime, timedelta
+
 import cv2
 import numpy as np
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from scipy.spatial.distance import cosine
 from pydantic import BaseModel
 
 import security  # type: ignore
 from database import get_db, engine, Base  # type: ignore
-from models import User, FaceEmbedding, VoiceProfile, BankAccount  # type: ignore
+from models import (  # type: ignore
+    User, FaceEmbedding, VoiceProfile, BankAccount,
+    Transaction, Beneficiary, Card, FixedDeposit,
+)
 from ai_engine import AIEngine  # type: ignore
 
 Base.metadata.create_all(bind=engine)
@@ -36,11 +43,20 @@ DEEPFAKE_DETECTION_WEIGHT = 0.30
 VOICE_SPOOF_WEIGHT = 0.20
 BEHAVIORAL_WEIGHT = 0.20
 
-# Hard ceiling on how long any single AI analysis call is allowed to run.
-# Combined with the ai_engine speed fixes this should rarely (if ever) be
-# hit, but it guarantees the endpoint always responds promptly instead of
-# hanging on a pathological input file.
 AI_CALL_TIMEOUT_SECONDS = 6.0
+
+FD_INTEREST_RATE = 6.75   # % p.a., flat rate for demo purposes
+RD_INTEREST_RATE = 6.25   # % p.a.
+
+BILLERS = {
+    "Electricity": ["TANGEDCO", "BESCOM", "MSEB", "Adani Electricity"],
+    "Mobile Recharge": ["Airtel", "Jio", "Vi", "BSNL"],
+    "DTH": ["Tata Play", "Dish TV", "Airtel Digital TV"],
+    "Broadband": ["ACT Fibernet", "BSNL Broadband", "Jio Fiber"],
+    "Water": ["Municipal Water Board"],
+    "Gas": ["Indane", "HP Gas", "Bharat Gas"],
+    "Credit Card": ["IOB Credit Card"],
+}
 
 
 class TransferRequest(BaseModel):
@@ -49,20 +65,66 @@ class TransferRequest(BaseModel):
     amount: float
 
 
+class BeneficiaryRequest(BaseModel):
+    user_id: int
+    nickname: str
+    account_number: str
+    ifsc_code: str
+    bank_name: str
+
+
+class BillPayRequest(BaseModel):
+    user_id: int
+    from_account: str
+    biller_category: str
+    biller_name: str
+    consumer_number: str
+    amount: float
+
+
+class FixedDepositRequest(BaseModel):
+    user_id: int
+    source_account: str
+    deposit_type: str  # "Fixed" | "Recurring"
+    principal_amount: float
+    tenure_months: int
+
+
+class ProfileUpdateRequest(BaseModel):
+    user_id: int
+    email: str | None = None
+    phone: str | None = None
+    address: str | None = None
+
+
+class CardActionRequest(BaseModel):
+    user_id: int
+    card_id: int
+    action: str  # "freeze" | "unfreeze" | "block"
+
+
 async def _run_ai(fn, *args, timeout: float = AI_CALL_TIMEOUT_SECONDS, fallback: dict) -> dict:
-    """
-    Runs a blocking ai_engine call in FastAPI's threadpool instead of on the
-    event loop directly. `fallback` is required (not optional) specifically
-    so the return type is always `dict`, never `None` - this is what silences
-    Pylance's reportOptionalSubscript false positive at the call sites below,
-    since previously `fallback=None`'s default made Pylance infer an Optional
-    return type even though every caller always passes a real fallback dict.
-    """
     try:
         return await asyncio.wait_for(run_in_threadpool(fn, *args), timeout=timeout)
     except asyncio.TimeoutError:
         print(f"[WARN] AI call {getattr(fn, '__name__', fn)} timed out after {timeout}s")
         return fallback
+
+
+def _record_transaction(db: Session, account: BankAccount, txn_type: str, amount: float,
+                         category: str, description: str, counterparty: str | None = None):
+    txn = Transaction(
+        account_id=account.id,
+        user_id=account.user_id,
+        txn_type=txn_type,
+        amount=amount,
+        balance_after=account.balance,
+        category=category,
+        description=description,
+        counterparty=counterparty,
+    )
+    db.add(txn)
+    return txn
 
 
 @app.post("/register")
@@ -106,12 +168,26 @@ async def register(
 
     if role == "Account Holder":
         base_acct = f"31504000{user.id:04d}"
-        accounts = [
-            BankAccount(user_id=user.id, account_number=f"{base_acct}1", account_type="Savings Account", balance=254000.50),
-            BankAccount(user_id=user.id, account_number=f"{base_acct}2", account_type="Current Account", balance=1120000.00),
-            BankAccount(user_id=user.id, account_number=f"{base_acct}3", account_type="Home Loan", balance=-1500000.00),
-        ]
-        db.add_all(accounts)
+        savings = BankAccount(user_id=user.id, account_number=f"{base_acct}1", account_type="Savings Account", balance=254000.50)
+        current = BankAccount(user_id=user.id, account_number=f"{base_acct}2", account_type="Current Account", balance=1120000.00)
+        loan = BankAccount(user_id=user.id, account_number=f"{base_acct}3", account_type="Home Loan", balance=-1500000.00)
+        db.add_all([savings, current, loan])
+        db.flush()  # so savings.id is available for the card FK below
+
+        # Auto-issue a debit card against the new Savings account, same as
+        # a real bank would at account opening.
+        card = Card(
+            user_id=user.id,
+            account_id=savings.id,
+            card_number_last4=f"{random.randint(0, 9999):04d}",
+            card_type="Debit",
+            card_network="RuPay",
+            expiry_month=datetime.utcnow().month,
+            expiry_year=datetime.utcnow().year + 5,
+            status="Active",
+        )
+        db.add(card)
+
     db.commit()
 
     return {"status": "success", "message": "User registered successfully"}
@@ -138,19 +214,22 @@ async def login(
     nparr = np.frombuffer(frame_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # Face count check and voice-feature extraction don't depend on each
-    # other - run them concurrently in the threadpool instead of one after
-    # another, shaving real wall-clock time off login.
+    # Kick off ALL AI work at once instead of sequentially
     face_count_task = run_in_threadpool(ai_engine.detect_faces, img)
-    voice_task = run_in_threadpool(ai_engine.extract_voice_features, audio_bytes, _suffix_from_upload(audio))
+    face_embed_task = run_in_threadpool(ai_engine.extract_face_embedding, img)
+    voice_task = run_in_threadpool(
+        ai_engine.extract_voice_features, audio_bytes, _suffix_from_upload(audio)
+    )
 
-    face_count = await face_count_task
+    face_count, live_face, live_voice = await asyncio.gather(
+        face_count_task, face_embed_task, voice_task
+    )
+
     if face_count == 0:
         raise HTTPException(status_code=401, detail="Login Denied: No face detected. Please look at the camera.")
     elif face_count > 1:
         raise HTTPException(status_code=401, detail="Login Denied: Multiple faces detected. Shoulder-surfing risk.")
 
-    live_face = await run_in_threadpool(ai_engine.extract_face_embedding, img)
     if not live_face:
         raise HTTPException(status_code=401, detail="No face detected in live feed.")
 
@@ -159,10 +238,8 @@ async def login(
         raise HTTPException(status_code=401, detail="Face biometric data not found.")
 
     face_similarity = 1 - cosine(live_face, list(db_face.embedding))  # type: ignore
-    if face_similarity < 0.40:
+    if face_similarity < 0.55:
         raise HTTPException(status_code=401, detail="Face verification failed.")
-
-    live_voice = await voice_task
 
     db_voice = db.query(VoiceProfile).filter(VoiceProfile.user_id == user.id).first()
     if not db_voice or db_voice.feature_vector is None:
@@ -174,7 +251,6 @@ async def login(
 
     token = security.create_access_token(data={"sub": user.customer_id, "user_id": user.id, "role": role})  # type: ignore
     return {"access_token": token, "token_type": "bearer", "role": role}
-
 
 def _suffix_from_upload(upload: UploadFile) -> str:
     name = (upload.filename or "").lower()
@@ -204,7 +280,6 @@ async def quick_face_check(
     user_id: int = Form(...),
     frame: UploadFile = File(...),
 ):
-    
     _decode_and_verify_token(token, user_id)
 
     frame_bytes = await frame.read()
@@ -248,9 +323,6 @@ async def verify_session(
     nparr = np.frombuffer(frame_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # Kick off all independent AI work concurrently in the threadpool
-    # instead of sequentially - this is what makes each 20s cycle actually
-    # come back quickly instead of stacking up latency.
     face_count_task = run_in_threadpool(ai_engine.detect_faces, img) if img is not None else None
     face_embed_task = run_in_threadpool(ai_engine.extract_face_embedding, img) if img is not None else None
     deepfake_task = _run_ai(
@@ -343,15 +415,32 @@ async def simulate_attack(file: UploadFile = File(...), filename: str = Form(Non
                   "debug_signals": {"note": "analysis_timed_out"}},
     )
 
+    debug_note = analysis.get("debug_signals", {}).get("note")
+    inconclusive_notes = {
+        "no_face_detected", "image_decode_failed", "audio_decode_failed",
+        "analysis_timed_out", "unrecognized_file_type",
+    }
+    is_inconclusive = debug_note in inconclusive_notes or (
+        debug_note is not None and debug_note.startswith("analysis_error")
+    )
+
+    if is_inconclusive:
+        classification = "inconclusive"
+        message = f"Could not confidently analyze this media ({debug_note}). Try a clearer frontal-face sample."
+    else:
+        classification = "fake" if analysis["is_fake"] else "real"
+        message = "Deepfake Artifacts Detected! Terminating session." if analysis["is_fake"] else "Media verified as authentic."
+
     return {
         "status": "success",
-        "classification": "fake" if analysis["is_fake"] else "real",
+        "classification": classification,
         "real_percentage": analysis["real_percentage"],
         "fake_percentage": analysis["fake_percentage"],
-        "is_active": not analysis["is_fake"],
-        "message": "Deepfake Artifacts Detected! Terminating session." if analysis["is_fake"] else "Media verified as authentic.",
+        "is_active": not (analysis["is_fake"]),  # inconclusive doesn't force logout
+        "message": message,
         "debug_signals": analysis.get("debug_signals", {}),
     }
+
 
 @app.get("/accounts")
 def get_accounts(user_id: int, db: Session = Depends(get_db)):
@@ -371,9 +460,247 @@ def transfer_funds(req: TransferRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
     from_acc.balance -= req.amount  # type: ignore
+    _record_transaction(
+        db, from_acc, "debit", req.amount, "Transfer",
+        f"Transfer to {req.to_account}", counterparty=req.to_account,
+    )
 
     if to_acc:
         to_acc.balance += req.amount  # type: ignore
+        _record_transaction(
+            db, to_acc, "credit", req.amount, "Transfer",
+            f"Transfer from {req.from_account}", counterparty=req.from_account,
+        )
+
+    db.commit()
+    return {"status": "success"}
+
+
+# ----------------------------------------------------------------------
+# Transaction history
+# ----------------------------------------------------------------------
+@app.get("/transactions")
+def get_transactions(user_id: int, account_number: str | None = None, limit: int = 50,
+                      db: Session = Depends(get_db)):
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if account_number:
+        acc = db.query(BankAccount).filter(BankAccount.account_number == account_number).first()
+        if not acc:
+            raise HTTPException(status_code=404, detail="Account not found")
+        query = query.filter(Transaction.account_id == acc.id)
+
+    txns = query.order_by(desc(Transaction.created_at)).limit(limit).all()
+
+    results = []
+    for t in txns:
+        acc = db.query(BankAccount).filter(BankAccount.id == t.account_id).first()
+        results.append({
+            "id": t.id,
+            "account_number": acc.account_number if acc else None,
+            "txn_type": t.txn_type,
+            "amount": t.amount,
+            "balance_after": t.balance_after,
+            "category": t.category,
+            "description": t.description,
+            "counterparty": t.counterparty,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        })
+    return results
+
+
+# ----------------------------------------------------------------------
+# Beneficiaries
+# ----------------------------------------------------------------------
+@app.get("/beneficiaries")
+def list_beneficiaries(user_id: int, db: Session = Depends(get_db)):
+    return db.query(Beneficiary).filter(Beneficiary.user_id == user_id).order_by(desc(Beneficiary.created_at)).all()
+
+
+@app.post("/beneficiaries")
+def add_beneficiary(req: BeneficiaryRequest, db: Session = Depends(get_db)):
+    existing = db.query(Beneficiary).filter(
+        Beneficiary.user_id == req.user_id,
+        Beneficiary.account_number == req.account_number,
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="This beneficiary is already saved")
+
+    beneficiary = Beneficiary(
+        user_id=req.user_id,
+        nickname=req.nickname,
+        account_number=req.account_number,
+        ifsc_code=req.ifsc_code,
+        bank_name=req.bank_name,
+    )
+    db.add(beneficiary)
+    db.commit()
+    db.refresh(beneficiary)
+    return beneficiary
+
+
+@app.delete("/beneficiaries/{beneficiary_id}")
+def delete_beneficiary(beneficiary_id: int, user_id: int, db: Session = Depends(get_db)):
+    beneficiary = db.query(Beneficiary).filter(
+        Beneficiary.id == beneficiary_id, Beneficiary.user_id == user_id
+    ).first()
+    if not beneficiary:
+        raise HTTPException(status_code=404, detail="Beneficiary not found")
+    db.delete(beneficiary)
+    db.commit()
+    return {"status": "success"}
+
+
+# ----------------------------------------------------------------------
+# Bill payments & recharge
+# ----------------------------------------------------------------------
+@app.get("/billers")
+def get_billers():
+    return BILLERS
+
+
+@app.post("/bills/pay")
+def pay_bill(req: BillPayRequest, db: Session = Depends(get_db)):
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+
+    from_acc = db.query(BankAccount).filter(BankAccount.account_number == req.from_account).first()
+    if not from_acc:
+        raise HTTPException(status_code=404, detail="Source account not found")
+    if from_acc.balance < req.amount:  # type: ignore
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    from_acc.balance -= req.amount  # type: ignore
+    category = "Recharge" if req.biller_category == "Mobile Recharge" else "Bill Payment"
+    _record_transaction(
+        db, from_acc, "debit", req.amount, category,
+        f"{req.biller_category} - {req.biller_name} ({req.consumer_number})",
+        counterparty=req.biller_name,
+    )
+    db.commit()
+    return {"status": "success", "message": f"₹{req.amount:.2f} paid to {req.biller_name} successfully"}
+
+
+# ----------------------------------------------------------------------
+# Fixed / Recurring deposits
+# ----------------------------------------------------------------------
+@app.get("/deposits")
+def list_deposits(user_id: int, db: Session = Depends(get_db)):
+    return db.query(FixedDeposit).filter(FixedDeposit.user_id == user_id).order_by(desc(FixedDeposit.start_date)).all()
+
+
+@app.post("/deposits")
+def create_deposit(req: FixedDepositRequest, db: Session = Depends(get_db)):
+    if req.principal_amount <= 0:
+        raise HTTPException(status_code=400, detail="Principal amount must be greater than zero")
+    if req.tenure_months <= 0:
+        raise HTTPException(status_code=400, detail="Tenure must be at least 1 month")
+
+    source_acc = db.query(BankAccount).filter(BankAccount.account_number == req.source_account).first()
+    if not source_acc:
+        raise HTTPException(status_code=404, detail="Source account not found")
+    if source_acc.balance < req.principal_amount:  # type: ignore
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    rate = RD_INTEREST_RATE if req.deposit_type == "Recurring" else FD_INTEREST_RATE
+    maturity_amount = req.principal_amount * (1 + (rate / 100) * (req.tenure_months / 12))
+    start = datetime.utcnow()
+    maturity_date = start + timedelta(days=30 * req.tenure_months)
+
+    source_acc.balance -= req.principal_amount  # type: ignore
+    _record_transaction(
+        db, source_acc, "debit", req.principal_amount, "Deposit",
+        f"{req.deposit_type} Deposit opened ({req.tenure_months} months)",
+    )
+
+    deposit = FixedDeposit(
+        user_id=req.user_id,
+        source_account_id=source_acc.id,
+        deposit_type=req.deposit_type,
+        principal_amount=req.principal_amount,
+        interest_rate=rate,
+        tenure_months=req.tenure_months,
+        start_date=start,
+        maturity_date=maturity_date,
+        maturity_amount=round(maturity_amount, 2),
+        status="Active",
+    )
+    db.add(deposit)
+    db.commit()
+    db.refresh(deposit)
+    return deposit
+
+
+# ----------------------------------------------------------------------
+# Cards
+# ----------------------------------------------------------------------
+@app.get("/cards")
+def list_cards(user_id: int, db: Session = Depends(get_db)):
+    cards = db.query(Card).filter(Card.user_id == user_id).all()
+    results = []
+    for c in cards:
+        acc = db.query(BankAccount).filter(BankAccount.id == c.account_id).first()
+        results.append({
+            "id": c.id,
+            "card_number_last4": c.card_number_last4,
+            "card_type": c.card_type,
+            "card_network": c.card_network,
+            "expiry_month": c.expiry_month,
+            "expiry_year": c.expiry_year,
+            "status": c.status,
+            "linked_account_number": acc.account_number if acc else None,
+        })
+    return results
+
+
+@app.post("/cards/action")
+def card_action(req: CardActionRequest, db: Session = Depends(get_db)):
+    card = db.query(Card).filter(Card.id == req.card_id, Card.user_id == req.user_id).first()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if req.action == "freeze":
+        card.status = "Frozen"  # type: ignore
+    elif req.action == "unfreeze":
+        card.status = "Active"  # type: ignore
+    elif req.action == "block":
+        card.status = "Blocked"  # type: ignore
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action. Use freeze, unfreeze, or block.")
+
+    db.commit()
+    return {"status": "success", "card_status": card.status}
+
+
+# ----------------------------------------------------------------------
+# Profile
+# ----------------------------------------------------------------------
+@app.get("/profile")
+def get_profile(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "user_id": user.id,
+        "full_name": user.full_name,
+        "customer_id": user.customer_id,
+        "email": user.email,
+        "phone": user.phone,
+        "address": user.address,
+    }
+
+
+@app.put("/profile")
+def update_profile(req: ProfileUpdateRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == req.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if req.email is not None:
+        user.email = req.email  # type: ignore
+    if req.phone is not None:
+        user.phone = req.phone  # type: ignore
+    if req.address is not None:
+        user.address = req.address  # type: ignore
 
     db.commit()
     return {"status": "success"}
